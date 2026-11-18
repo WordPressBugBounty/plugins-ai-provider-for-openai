@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace WordPress\OpenAiAiProvider\Metadata;
 
+use WordPress\AiClient\Common\Exception\RuntimeException;
 use WordPress\AiClient\Files\Enums\FileTypeEnum;
 use WordPress\AiClient\Files\Enums\MediaOrientationEnum;
 use WordPress\AiClient\Messages\Enums\ModalityEnum;
@@ -17,7 +18,9 @@ use WordPress\AiClient\Providers\Models\EmbeddingGeneration\Contracts\EmbeddingG
 use WordPress\AiClient\Providers\Models\Enums\CapabilityEnum;
 use WordPress\AiClient\Providers\Models\Enums\OptionEnum;
 use WordPress\AiClient\Providers\OpenAiCompatibleImplementation\AbstractOpenAiCompatibleModelMetadataDirectory;
+use WordPress\OpenAiAiProvider\Provider\OpenAiApiOperation;
 use WordPress\OpenAiAiProvider\Provider\OpenAiProvider;
+use WordPress\OpenAiAiProvider\Traits\OpenAiApiProfileContextTrait;
 
 /**
  * Class for the OpenAI model metadata directory.
@@ -30,6 +33,8 @@ use WordPress\OpenAiAiProvider\Provider\OpenAiProvider;
  */
 class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadataDirectory
 {
+    use OpenAiApiProfileContextTrait;
+
     /**
      * Regular expression matching the model ID prefixes of OpenAI reasoning models.
      *
@@ -38,12 +43,26 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
      * whose behavior has been verified are recognized; new o-families require documentation and
      * tests before they are added. GPT-5 chat aliases share a reasoning-family prefix but are
      * non-reasoning models and are handled separately by self::isNonReasoningChatModel().
+     * Documented GPT-6 models are matched separately by self::GPT6_MODEL_ID_PATTERN.
      *
      * @since 1.1.0
      *
      * @var string
      */
     private const REASONING_MODEL_ID_PATTERN = '/^(?:codex-mini-latest|gpt-5(?:\.\d+)?|o(?:1|3|4))(?:-|$)/';
+
+    /**
+     * Regular expression matching the IDs of documented GPT-6 models.
+     *
+     * GPT-6 models accept text and image input and are reasoning models. None of them uses
+     * reasoning effort `none` by default. Only documented IDs are listed, so capabilities are not
+     * assigned to GPT-6 models before they are documented.
+     *
+     * @since 1.3.0
+     *
+     * @var string
+     */
+    private const GPT6_MODEL_ID_PATTERN = '/^gpt-(?:6-(?:astra|luna|sol)|6\.1-sol)$/';
 
     /**
      * Regular expression matching the IDs of reasoning models that use reasoning effort `none` by default.
@@ -78,11 +97,57 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
      */
     protected function createRequest(HttpMethodEnum $method, string $path, array $headers = [], $data = null): Request
     {
-        return new Request(
+        $apiProfile = $this->getOpenAiApiProfile();
+        $operation = OpenAiApiOperation::LIST_MODELS;
+
+        if ($apiProfile !== null && !$apiProfile->supportsOperation($operation)) {
+            throw new RuntimeException(
+                'The selected OpenAI API profile does not support listing models.'
+            );
+        }
+
+        $defaultUrl = OpenAiProvider::url($path);
+        $requestUrl = $apiProfile !== null
+            ? $apiProfile->getRequestUrl($defaultUrl, $path, $operation)
+            : $defaultUrl;
+
+        $request = new Request(
             $method,
-            OpenAiProvider::url($path),
+            $requestUrl,
             $headers,
             $data
+        );
+
+        return $apiProfile !== null
+            ? $apiProfile->prepareRequest($request, $operation)
+            : $request;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * Avoids a live `GET /models` round trip for IDs the shared classifier treats as text generation models. Those
+     * IDs are not checked against the account's model catalog, so an unknown or inaccessible ID fails when the
+     * generation request is sent. Other IDs (image, embedding, text-to-speech, realtime, transcription, instruct, and
+     * IDs outside OpenAI's text model namespaces) still fall back to listing models, which confirms that the provider
+     * offers them.
+     *
+     * @since 1.3.0
+     *
+     * @param list<string> $modelIds The explicit model IDs.
+     * @return array<string, ModelMetadata> Map of model ID to explicit model metadata.
+     */
+    protected function createModelMetadataForExplicitModelIds(array $modelIds): array
+    {
+        return array_filter(
+            $this->createModelMetadataMap($modelIds),
+            static function (ModelMetadata $metadata): bool {
+                return in_array(
+                    CapabilityEnum::textGeneration(),
+                    $metadata->getSupportedCapabilities(),
+                    true
+                );
+            }
         );
     }
 
@@ -93,12 +158,52 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
      */
     protected function parseResponseToModelMetadataList(Response $response): array
     {
+        $apiProfile = $this->getOpenAiApiProfile();
+        if ($apiProfile !== null) {
+            $operation = OpenAiApiOperation::LIST_MODELS;
+            if (!$apiProfile->supportsOperation($operation)) {
+                throw new RuntimeException(
+                    'The selected OpenAI API profile does not support listing models.'
+                );
+            }
+
+            $response = $apiProfile->normalizeResponse($response, $operation);
+            $profileModels = $apiProfile->parseModelMetadataList($response);
+            if ($profileModels !== null) {
+                return $profileModels;
+            }
+        }
+
         /** @var ModelsResponseData $responseData */
         $responseData = $response->getData();
         if (!isset($responseData['data']) || !$responseData['data']) {
             throw ResponseException::fromMissingData('OpenAI', 'data');
         }
 
+        $modelIds = array_map(
+            static function (array $modelData): string {
+                return $modelData['id'];
+            },
+            (array) $responseData['data']
+        );
+
+        $models = array_values($this->createModelMetadataMap($modelIds));
+
+        usort($models, [$this, 'modelSortCallback']);
+
+        return $models;
+    }
+
+    /**
+     * Creates model metadata for the given model IDs, using the shared OpenAI model ID classifier.
+     *
+     * @since 1.3.0
+     *
+     * @param list<string> $modelIds The model IDs.
+     * @return array<string, ModelMetadata> Map of model ID to model metadata.
+     */
+    private function createModelMetadataMap(array $modelIds): array
+    {
         $allModalityCombinationsWithText = [
             [ModalityEnum::text()],
             [ModalityEnum::text(), ModalityEnum::image()],
@@ -154,6 +259,16 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
             new SupportedOption(
                 OptionEnum::inputModalities(),
                 $allModalityCombinationsWithText
+            ),
+            new SupportedOption(OptionEnum::outputModalities(), [[ModalityEnum::text()]]),
+        ]);
+        $gptReasoningTextAndImageInputOptions = array_merge($gptBaseOptions, [
+            new SupportedOption(
+                OptionEnum::inputModalities(),
+                [
+                    [ModalityEnum::text()],
+                    [ModalityEnum::text(), ModalityEnum::image()],
+                ]
             ),
             new SupportedOption(OptionEnum::outputModalities(), [[ModalityEnum::text()]]),
         ]);
@@ -261,7 +376,12 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
             new SupportedOption(OptionEnum::customOptions()),
         ];
 
-        $modelsData = (array) $responseData['data'];
+        $modelsData = array_map(
+            static function (string $modelId): array {
+                return ['id' => $modelId];
+            },
+            $modelIds
+        );
 
         $models = array_values(
             array_map(
@@ -271,6 +391,7 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
                     $gptReasoningOptions,
                     $gptMultimodalInputOptions,
                     $gptReasoningMultimodalInputOptions,
+                    $gptReasoningTextAndImageInputOptions,
                     $gptMultimodalSpeechOutputOptions,
                     $gptSearchOptions,
                     $imageCapabilities,
@@ -325,7 +446,11 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
                         && !str_contains($modelId, '-realtime')
                         && !str_contains($modelId, '-transcribe')
                     ) {
-                        if (self::supportsMultimodalTextInput($modelId)) {
+                        if (self::isGpt6Model($modelId)) {
+                            // No GPT-6 model defaults to reasoning effort `none`, so none supports sampling options.
+                            $modelCaps = $gptCapabilities;
+                            $modelOptions = $gptReasoningTextAndImageInputOptions;
+                        } elseif (self::supportsMultimodalTextInput($modelId)) {
                             $modelCaps = $gptCapabilities;
                             $modelOptions = $gptMultimodalInputOptions;
                             // New multimodal output model for audio generation.
@@ -361,9 +486,40 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
             )
         );
 
-        usort($models, [$this, 'modelSortCallback']);
+        $modelsMetadata = [];
+        foreach ($models as $model) {
+            $modelsMetadata[$model->getId()] = $model;
+        }
 
-        return $models;
+        return $modelsMetadata;
+    }
+
+    /**
+     * Separates alternate API profile model catalogs in the SDK cache.
+     *
+     * The standard API profile retains its existing cache key. Alternate
+     * profile identities are hashed so account identifiers and other profile
+     * details never appear in persistent cache keys.
+     *
+     * @since 1.3.0
+     *
+     * @return string The cache key prefix.
+     */
+    protected function getBaseCacheKey(): string
+    {
+        $baseCacheKey = parent::getBaseCacheKey();
+
+        $apiProfile = $this->getOpenAiApiProfile();
+
+        if ($apiProfile === null) {
+            return $baseCacheKey;
+        }
+
+        $profileCacheKey = $apiProfile->getCacheKey();
+
+        return $baseCacheKey
+            . '_profile_'
+            . substr(hash('sha256', $profileCacheKey), 0, 16);
     }
 
     /**
@@ -383,11 +539,26 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
     }
 
     /**
+     * Checks whether an OpenAI text generation model is a documented GPT-6 model.
+     *
+     * GPT-6 models are reasoning models that support text and image input only.
+     *
+     * @since 1.3.0
+     *
+     * @param string $modelId The model ID.
+     * @return bool True if the model is a documented GPT-6 model, false otherwise.
+     */
+    private static function isGpt6Model(string $modelId): bool
+    {
+        return (bool) preg_match(self::GPT6_MODEL_ID_PATTERN, $modelId);
+    }
+
+    /**
      * Checks whether an OpenAI text generation model is a reasoning model.
      *
      * Reasoning model families include codex-mini-latest, versioned GPT-5 models (e.g. `gpt-5`,
-     * `gpt-5.5`), and the verified o1, o3, and o4 families. GPT-5 chat aliases are non-reasoning
-     * models and are handled separately; see {@see self::isNonReasoningChatModel()} and
+     * `gpt-5.5`), documented GPT-6 models, and the verified o1, o3, and o4 families. GPT-5 chat aliases are
+     * non-reasoning models and are handled separately; see {@see self::isNonReasoningChatModel()} and
      * {@see self::supportsSamplingOptions()}.
      *
      * @since 1.1.0
@@ -397,7 +568,7 @@ class OpenAiModelMetadataDirectory extends AbstractOpenAiCompatibleModelMetadata
      */
     private static function isReasoningModel(string $modelId): bool
     {
-        return (bool) preg_match(self::REASONING_MODEL_ID_PATTERN, $modelId);
+        return (bool) preg_match(self::REASONING_MODEL_ID_PATTERN, $modelId) || self::isGpt6Model($modelId);
     }
 
     /**
